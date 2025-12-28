@@ -2,6 +2,7 @@ import zipfile
 from io import BytesIO
 from typing import BinaryIO
 from xml.etree import ElementTree as ET
+import posixpath
 
 from bs4 import BeautifulSoup, Tag
 
@@ -96,6 +97,53 @@ def _replace_equations(tag: Tag):
         raise ValueError(f"Not supported tag: {tag.name}")
 
 
+def _sanitize_rels(content_bytes: bytes, rel_name: str, zip_out: zipfile.ZipFile) -> bytes:
+    """Create empty package parts for Relationship Targets equal to "NULL".
+
+    Args:
+        content_bytes (bytes): The XML content of the .rels file as bytes.
+        rel_name (str): The name of the .rels file.
+        zip_out (zipfile.ZipFile): The output ZipFile object where new parts will be added.
+
+    Returns:
+        bytes: The original content bytes (unchanged).
+    """
+    try:
+        root = ET.fromstring(content_bytes)
+    except ET.ParseError:
+        return content_bytes
+
+    placeholder_paths = set()
+    for rel in list(root):
+        # Get local tag name without relying on QName.localname
+        name = rel.tag.rsplit('}', 1)[-1] if '}' in rel.tag else rel.tag
+        if name != "Relationship":
+            continue
+        target = (rel.get("Target") or "").strip()
+        if target.upper() != "NULL":
+            continue
+        base = rel_name.split("/_rels/")[0] + "/" if "/_rels/" in rel_name else ""
+        entry_path = (base + target).lstrip("/")
+        entry_path = posixpath.normpath(entry_path)
+        # Avoid absolute paths and path traversal
+        if entry_path.startswith("/") or entry_path.startswith(".."):
+            continue
+        placeholder_paths.add(entry_path)
+
+    if not placeholder_paths:
+        return content_bytes
+
+    if isinstance(zip_out, zipfile.ZipFile):
+        for pth in placeholder_paths:
+            try:
+                zip_out.writestr(pth, b"")
+            except Exception as exc:
+                # On failure to write, continue
+                pass
+
+    return content_bytes
+
+
 def _pre_process_math(content: bytes) -> bytes:
     """
     Pre-processes the math content in a DOCX -> XML file by converting OMML (Office Math Markup Language) elements to LaTeX.
@@ -141,6 +189,9 @@ def pre_process_docx(input_docx: BinaryIO) -> BinaryIO:
         with zipfile.ZipFile(output_docx, mode="w") as zip_output:
             zip_output.comment = zip_input.comment
             for name, content in files.items():
+                if name.endswith(".rels"):
+                    content = _sanitize_rels(content, name, zip_output)
+
                 if name in pre_process_enable_files:
                     try:
                         # Pre-process the content
